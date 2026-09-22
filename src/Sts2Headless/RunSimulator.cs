@@ -312,6 +312,9 @@ public class RunSimulator
     /// </summary>
     private static List<Dictionary<string, object?>>? PileEntries(CardPile? pile)
     {
+#if HEADLESS_EXPORTS_OFF
+        return null;
+#else
         var cards = pile?.Cards;
         if (cards == null) return null;
         var list = new List<Dictionary<string, object?>>(cards.Count);
@@ -325,6 +328,7 @@ public class RunSimulator
             });
         }
         return list;
+    #endif
     }
 
     /// <summary>
@@ -338,6 +342,9 @@ public class RunSimulator
     /// </summary>
     private static object? RngSnapshot(object? rngSet)
     {
+#if HEADLESS_EXPORTS_OFF
+        return null;
+#else
         if (rngSet == null) return null;
         try
         {
@@ -365,6 +372,7 @@ public class RunSimulator
             return outer.Count > 0 ? outer : null;
         }
         catch { return null; }
+    #endif
     }
 
     private static object? FlattenPublicState(object? value)
@@ -1174,111 +1182,8 @@ public class RunSimulator
             YieldPatches.SuppressYield = false;
         }
 
-        // Second fallback: if still stuck after SuppressYield window, cancel and retry.
-        // The WaitUntilQueue TCS is likely deadlocked.
         if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
-        {
-            Log("EndTurn stuck, cancelling and retrying with SuppressYield...");
-            try
-            {
-                RunManager.Instance.ActionExecutor.Cancel();
-                _syncCtx.Pump();
-                Thread.Sleep(50);
-                _syncCtx.Pump();
-
-                // Reset the player ready state and try again with SuppressYield
-                CombatManager.Instance.UndoReadyToEndTurn(player);
-                _syncCtx.Pump();
-
-                YieldPatches.SuppressYield = true;
-                try
-                {
-                    PlayerCmd.EndTurn(player, canBackOut: false);
-                    _syncCtx.Pump();
-                }
-                finally
-                {
-                    YieldPatches.SuppressYield = false;
-                }
-
-                for (int i = 0; i < 100; i++)
-                {
-                    _syncCtx.Pump();
-                    if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                    if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                    if (IsPlayPhase()) break;
-                    Thread.Sleep(10);
-                }
-            }
-            catch (Exception ex) { Log($"Cancel retry: {ex.Message}"); }
-
-            // NUCLEAR OPTION: If STILL stuck after 2 attempts, use ThreadPool to force
-            // the enemy turn processing to complete with SuppressYield permanently on.
-            if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
-            {
-                var stuckState = CombatManager.Instance.DebugOnlyGetState();
-                var stuckEnemies = stuckState?.Enemies?.Where(e => e != null && e.IsAlive)
-                    .Select(e => $"{e.Monster?.GetType().Name}(hp={e.CurrentHp})").ToList();
-                Log($"EndTurn STILL stuck after retry — nuclear fallback. Round={stuckState?.RoundNumber}, " +
-                    $"Enemies=[{string.Join(",", stuckEnemies ?? new())}], " +
-                    $"IsPlayPhase={IsPlayPhase()}, " +
-                    $"IsInProgress={CombatManager.Instance.IsInProgress}, " +
-                    $"ActionExecutor.IsRunning={RunManager.Instance.ActionExecutor.IsRunning}");
-                try
-                {
-                    // Cancel again and undo
-                    RunManager.Instance.ActionExecutor.Cancel();
-                    _syncCtx.Pump();
-                    CombatManager.Instance.UndoReadyToEndTurn(player);
-                    _syncCtx.Pump();
-                    Thread.Sleep(50);
-
-                    // Run EndTurn on ThreadPool with SuppressYield permanently on
-                    YieldPatches.SuppressYield = true;
-                    var endTurnTask = Task.Run(() =>
-                    {
-                        PlayerCmd.EndTurn(player, canBackOut: false);
-                    });
-
-                    // Aggressively pump sync context while waiting (up to 5 seconds)
-                    for (int i = 0; i < 500; i++)
-                    {
-                        _syncCtx.Pump();
-                        if (endTurnTask.IsCompleted) break;
-                        if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                        if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                        if (IsPlayPhase()) break;
-                        Thread.Sleep(10);
-                    }
-                    YieldPatches.SuppressYield = false;
-
-                    // If still not play phase, try just waiting a bit more
-                    if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
-                    {
-                        for (int i = 0; i < 200; i++)
-                        {
-                            _syncCtx.Pump();
-                            Thread.Sleep(10);
-                            if (IsPlayPhase() || !CombatManager.Instance.IsInProgress || player.Creature.IsDead)
-                                break;
-                        }
-                    }
-
-                    if (IsPlayPhase())
-                        Log("Nuclear fallback SUCCEEDED — play phase resumed");
-                    else
-                    {
-                        Log("Nuclear fallback FAILED — forcing game_over to escape deadlock");
-                        return GameOverState(false);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log($"Nuclear fallback error: {ex.Message}");
-                    YieldPatches.SuppressYield = false;
-                }
-            }
-        }
+            return Error("Enemy turn did not reach a decision boundary; source invalid (no cancellation or retry).");
 
         return DetectDecisionPoint();
     }
@@ -1309,23 +1214,25 @@ public class RunSimulator
         if (cardIndex < 0 || cardIndex >= cards.Count)
             return Error($"Invalid card index {cardIndex}, {cards.Count} cards available");
 
-        var card = cards[cardIndex];
-        Log($"Selected card reward: {card.GetType().Name}");
-
-        // Add card to deck
-        try
+        // Let CardReward.OnSelect own acquisition, history, and extra-choice hooks.
+        // The headless selector supplies only the player's explicit choice.
+        var reward = _pendingCardReward;
+        _pendingChoiceAction = Task.Run(async () =>
         {
-            MegaCrit.Sts2.Core.Commands.CardPileCmd
-                .Add(card, MegaCrit.Sts2.Core.Entities.Cards.PileType.Deck)
-                .GetAwaiter().GetResult();
-            _syncCtx.Pump();
-            RunManager.Instance.RewardSynchronizer.SyncLocalObtainedCard(card);
-        }
-        catch (Exception ex) { Log($"Add card to deck: {ex.Message}"); }
-
-        _pendingCardReward = null;
-        // Check if more rewards pending
+            await reward.SelectUnsynchronized();
+            AdvanceCardReward();
+        });
+        WaitForChoiceAction();
+        if (!_cardSelector.HasPendingReward)
+            return Error("Native card reward did not request a choice; source invalid.");
+        _cardSelector.ResolveReward(cardIndex);
         return DetectDecisionPoint();
+    }
+
+    private void AdvanceCardReward()
+    {
+        if (_pendingCardReward != null) _pendingRewards?.Remove(_pendingCardReward);
+        _pendingCardReward = _pendingRewards?.OfType<CardReward>().FirstOrDefault();
     }
 
     private Dictionary<string, object?> DoSkipCardReward(Player player)
@@ -1342,8 +1249,9 @@ public class RunSimulator
         if (_pendingCardReward != null)
         {
             Log("Skipping card reward");
+            if (!_pendingCardReward.CanSkip) return Error("This reward cannot be skipped.");
             _pendingCardReward.OnSkipped();
-            _pendingCardReward = null;
+            AdvanceCardReward();
         }
         return DetectDecisionPoint();
     }
@@ -1398,22 +1306,8 @@ public class RunSimulator
             // pending selection appears so the caller can resolve it; the background task
             // continues once the selector's TCS is fed by select_cards.
             var inv = merchantRoom.GetLocalInventory();
-            var task = Task.Run(() => entry.OnTryPurchaseWrapper(inv));
-            for (int i = 0; i < 100; i++)
-            {
-                _syncCtx.Pump();
-                if (_cardSelector.HasPending || _cardSelector.HasPendingReward) break;
-                if (_pendingBundles != null) break;
-                if (task.IsCompleted) break;
-                Thread.Sleep(10);
-            }
-            if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
-            {
-                Log($"Buy relic {entry.Model.GetType().Name}: yielded for pending selection");
-                return DetectDecisionPoint();
-            }
-            if (!task.IsCompleted) task.Wait(2000);
-            _syncCtx.Pump();
+            _pendingChoiceAction = Task.Run(() => entry.OnTryPurchaseWrapper(inv));
+                WaitForChoiceAction();
             Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
         catch (Exception ex) { return Error($"Buy relic failed: {ex.Message}"); }
@@ -1445,7 +1339,7 @@ public class RunSimulator
         catch (Exception ex)
         {
             // Potion purchase sometimes NullRefs in headless (missing potion slot UI)
-            Log($"Buy potion failed: {ex.Message}");
+            return ErrorWithTrace("Potion purchase failed", ex);
         }
 
         return DetectDecisionPoint();
@@ -1463,21 +1357,8 @@ public class RunSimulator
         try
         {
             // Run on background thread so card selection can pause (same pattern as event options)
-            var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()));
-            for (int i = 0; i < 100; i++)
-            {
-                _syncCtx.Pump();
-                if (_cardSelector.HasPending) break;
-                if (task.IsCompleted) break;
-                Thread.Sleep(10);
-            }
-            if (_cardSelector.HasPending)
-            {
-                WaitForActionExecutor();
-                return DetectDecisionPoint();
-            }
-            if (!task.IsCompleted) task.Wait(2000);
-            _syncCtx.Pump();
+            _pendingChoiceAction = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()));
+                WaitForChoiceAction();
             Log($"Removed card for {removal.Cost}g");
         }
         catch (Exception ex) { return Error($"Remove card failed: {ex.Message}"); }
@@ -1494,13 +1375,14 @@ public class RunSimulator
 
         var idx = Convert.ToInt32(args["bundle_index"]);
         Log($"Bundle selection: pack {idx}");
+        if (idx < 0 || idx >= _pendingBundles.Count) return Error("Invalid bundle index");
         var bundles = _pendingBundles;
         var tcs = _pendingBundleTcs;
         _pendingBundles = null;
         _pendingBundleTcs = null;
 
         // Set result directly (no ContinueWith/ThreadPool)
-        var selected = (idx >= 0 && idx < bundles.Count) ? bundles[idx] : bundles[0];
+        var selected = bundles[idx];
         tcs.TrySetResult(selected);
 
         _syncCtx.Pump();
@@ -1516,37 +1398,14 @@ public class RunSimulator
             return Error("select_cards requires 'indices' (comma-separated card indices)");
 
         var indicesStr = args["indices"]?.ToString() ?? "";
-        var indices = indicesStr.Split(',')
+        var indices = indicesStr.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Select(s => int.TryParse(s.Trim(), out var v) ? v : -1)
-            .Where(i => i >= 0)
             .ToArray();
 
         Log($"Card selection: indices [{string.Join(",", indices)}]");
         _cardSelector.ResolvePendingByIndices(indices);
         _syncCtx.Pump();
         WaitForActionExecutor();
-
-        // Extra wait for rest-site SMITH: the background ChooseLocalOption task
-        // needs time to complete the upgrade after card selection resolves.
-        if (_runState?.CurrentRoom is RestSiteRoom)
-        {
-            Thread.Sleep(200);
-            _syncCtx.Pump();
-            WaitForActionExecutor();
-            // Force to map after SMITH completes (same pattern as HEAL)
-            Log("Card selection in rest site (SMITH), forcing to map");
-            ForceToMap();
-            return MapSelectState();
-        }
-
-        // Extra wait for shop card removal: the purchase task needs to finish
-        if (_runState?.CurrentRoom is MerchantRoom)
-        {
-            Thread.Sleep(200);
-            _syncCtx.Pump();
-            WaitForActionExecutor();
-            Log("Card selection in shop (card removal), refreshing shop state");
-        }
 
         return DetectDecisionPoint();
     }
@@ -1628,17 +1487,13 @@ public class RunSimulator
             var afterPotions = player.Potions?.ToList() ?? new();
             if (afterPotions.Contains(potion))
             {
-                // Potion wasn't consumed — manually discard it
-                Log("Potion not consumed by action, manually discarding");
-                MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion).GetAwaiter().GetResult();
-                _syncCtx.Pump();
+                return Error("Potion action completed without consuming the potion; source invalid.");
             }
         }
         catch (Exception ex)
         {
             Log($"Use potion failed: {ex.Message}");
-            // Try manual discard as fallback
-            try { MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion).GetAwaiter().GetResult(); } catch { }
+            return ErrorWithTrace("Potion use failed; source invalid", ex);
         }
 
         return DetectDecisionPoint();
@@ -1675,41 +1530,14 @@ public class RunSimulator
             try
             {
                 // Run on background thread so Smith card selection can pause
-                var task = Task.Run(() => RunManager.Instance.RestSiteSynchronizer.ChooseLocalOption(optionIndex));
-                for (int i = 0; i < 100; i++)
-                {
-                    _syncCtx.Pump();
-                    if (_cardSelector.HasPending) break;
-                    if (task.IsCompleted) break;
-                    Thread.Sleep(10);
-                }
-                if (_cardSelector.HasPending)
-                {
-                    WaitForActionExecutor();
-                    return DetectDecisionPoint();
-                }
-                if (!task.IsCompleted) task.Wait(2000);
-                _syncCtx.Pump();
+                _pendingChoiceAction = Task.Run(() => RunManager.Instance.RestSiteSynchronizer.ChooseLocalOption(optionIndex));
+                WaitForChoiceAction();
             }
             catch (Exception ex)
             {
-                Log($"Rest site ChooseLocalOption failed: {ex.Message}");
+                return ErrorWithTrace("Rest site choice failed", ex);
             }
 
-            // After non-Smith rest site options (HEAL, etc.), the options may not clear.
-            // Wait for the action to complete (heal/dig), then force transition to map.
-            if (!_cardSelector.HasPending)
-            {
-                Log("Rest site: option chosen (non-Smith), waiting for action then forcing to map");
-                // Give the action time to complete (heal HP, dig for relic, etc.)
-                WaitForActionExecutor();
-                _syncCtx.Pump();
-                Thread.Sleep(200);
-                _syncCtx.Pump();
-                WaitForActionExecutor();
-                ForceToMap();
-                return MapSelectState();
-            }
         }
         // For events — use EventSynchronizer
         // Run Chosen() on a background thread so card selections can pause
@@ -1728,24 +1556,12 @@ public class RunSimulator
                         _eventOptionChosen = true;
                         _lastEventOptionCount = options.Count;
                         // Run on thread pool so GetSelectedCards/GetSelectedCardReward can block
-                        var task = Task.Run(() => options[optionIndex].Chosen());
-                        for (int i = 0; i < 100; i++)
-                        {
-                            _syncCtx.Pump();
-                            if (_cardSelector.HasPending || _cardSelector.HasPendingReward) break;
-                            if (_pendingBundles != null) break;
-                            if (task.IsCompleted) break;
-                            Thread.Sleep(10);
-                        }
-                        if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
-                        {
-                            WaitForActionExecutor();
-                            return DetectDecisionPoint();
-                        }
-                        if (!task.IsCompleted) task.Wait(2000);
-                        _syncCtx.Pump();
+                        if (_pendingChoiceAction is not null)
+                            throw new InvalidOperationException("An event choice is already in flight.");
+                        _pendingChoiceAction = Task.Run(() => options[optionIndex].Chosen());
+                        WaitForChoiceAction();
                     }
-                    catch (Exception ex) { Log($"Event choose: {ex.Message}"); }
+                    catch (Exception ex) { return ErrorWithTrace("Event choice failed", ex); }
                 }
 
                 // Note: do NOT force-finish on `optCountAfter == optCountBefore`. Events can
@@ -1761,56 +1577,18 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoLeaveRoom(Player player)
     {
-        Log("Leaving room");
-        try { RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult(); }
-        catch { }
-        _syncCtx.Pump();
-        WaitForActionExecutor();
-
-        // If still in a non-combat room, force to map
+        WaitForChoiceAction();
+        if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+            return Error("Resolve the pending choice before leaving.");
         var room = _runState?.CurrentRoom;
-        if (room is RestSiteRoom || room is MerchantRoom || room is EventRoom || room is TreasureRoom)
-        {
-            Log("Force leaving non-combat room to map");
-            try
-            {
-                RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
-                _syncCtx.Pump();
-                WaitForActionExecutor();
-            }
-            catch (Exception ex) { Log($"Force leave: {ex.Message}"); }
-        }
+        if (room is EventRoom ev && !ev.LocalMutableEvent.IsFinished)
+            return Error("An unfinished event cannot be left by the headless adapter.");
+        if (room is RestSiteRoom rest && rest.Options.Count > 0)
+            return Error("Remaining rest choices require an explicit native choice.");
+        if (room is not MerchantRoom && room is not EventRoom && room is not RestSiteRoom)
+            return Error("This room has no qualified leave action.");
+        ForceToMap();
         return DetectDecisionPoint();
-    }
-
-    /// <summary>
-    /// Headless mode skips Godot transition callbacks that normally trigger between-act healing
-    /// (AncientEventModel.BeforeEventStarted). Replicates the original sts2.dll formula:
-    ///   healAmount = MaxHp - CurrentHp  (i.e. heal to full)
-    ///   if Ascension >= 2: healAmount *= 0.8
-    /// No-op if the engine already healed (missingHp &lt;= 0), so this is safe alongside any
-    /// future engine path that does fire the callback.
-    /// Adapted from PR #83 commit cf75bec by @tianyumyum.
-    /// </summary>
-    private void HealBetweenActs()
-    {
-        if (_runState == null) return;
-        var player = _runState.Players[0];
-        if (player.Creature == null) return;
-
-        var currentHp = player.Creature.CurrentHp;
-        var maxHp = player.Creature.MaxHp;
-        var missingHp = maxHp - currentHp;
-        if (missingHp <= 0) return;
-
-        decimal healAmount = missingHp;
-        if (RunManager.Instance.HasAscension((AscensionLevel)2))
-            healAmount *= 0.8m;
-
-        var newHp = currentHp + (int)Math.Ceiling(healAmount);
-        if (newHp > maxHp) newHp = maxHp;
-        SetField(player.Creature, "_currentHp", newHp);
-        Log($"Between-act heal: {currentHp} → {newHp} (missing={missingHp}, ascension2+={RunManager.Instance.HasAscension((AscensionLevel)2)})");
     }
 
     private Dictionary<string, object?> DoProceed(Player player)
@@ -1823,15 +1601,8 @@ public class RunSimulator
         {
             if (combatRoom.IsPreFinished || !CombatManager.Instance.IsInProgress)
             {
-                // Final act boss → victory (same rule as DetectPostCombatState, #81).
-                if (_runState != null && _runState.CurrentActIndex >= 2)
-                {
-                    Log($"Final boss defeated via Proceed (Act {_runState.CurrentActIndex + 1}), reporting victory");
-                    return GameOverState(true);
-                }
                 RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
                 WaitForActionExecutor();
-                HealBetweenActs();
                 return DetectDecisionPoint();
             }
         }
@@ -1847,6 +1618,7 @@ public class RunSimulator
 
     private Dictionary<string, object?> DetectDecisionPoint()
     {
+        WaitForChoiceAction();
         if (_runState == null)
             return Error("No run in progress");
 
@@ -1922,7 +1694,7 @@ public class RunSimulator
                 ["decision"] = "card_reward",
                 ["context"] = RunContext(),
                 ["cards"] = cards,
-                ["can_skip"] = true,
+                ["can_skip"] = _cardSelector.CanSkipReward,
                 ["from_event"] = true,
                 ["player"] = PlayerSummary(_runState!.Players[0]),
             };
@@ -2015,7 +1787,7 @@ public class RunSimulator
                 if (IsPlayPhase()) return CombatPlayState(player);
                 if (!CombatManager.Instance.IsInProgress) return DetectPostCombatState(player, combatRoom);
             }
-            return CombatPlayState(player);
+            return Error("Combat did not reach a player decision boundary; source invalid.");
         }
 
         // Event room
@@ -2080,22 +1852,7 @@ public class RunSimulator
             var currentPoint = map.GetPoint(currentCoord.Value);
             if (currentPoint == null)
             {
-                Log($"GetPoint returned null for coord ({currentCoord.Value.col},{currentCoord.Value.row}), falling back to start");
-                // Current coord is invalid (stale after forced room transition); treat as no position
-                choices = new List<Dictionary<string, object?>>();
-                var sp = map.StartingMapPoint;
-                if (sp?.Children != null)
-                {
-                    foreach (var child in sp.Children)
-                    {
-                        choices.Add(new Dictionary<string, object?>
-                        {
-                            ["col"] = (int)child.coord.col,
-                            ["row"] = (int)child.coord.row,
-                            ["type"] = child.PointType.ToString(),
-                        });
-                    }
-                }
+                return Error("Current map coordinate is invalid; source invalid.");
             }
             else
             {
@@ -2171,6 +1928,10 @@ public class RunSimulator
             // block reflects Frail, calculateddamage reflects current Block, etc. ClearPreview
             // resets PreviewValue to BaseValue, and only damage/block/calculated vars override it,
             // so reading PreviewValue uniformly is safe. Issues #65 #69 #70 #71 #74 #75.
+            List<Dictionary<string, object?>>? damageByTarget = null;
+#if HEADLESS_EXPORTS_OFF
+            var stats = new Dictionary<string, object?>();
+#else
             var stats = new Dictionary<string, object?>();
             try
             {
@@ -2185,16 +1946,15 @@ public class RunSimulator
                 // Restore the live card to base state. UpdateDynamicVarPreview mutates the
                 // card's preview (and for self-cost cards like Momentum Strike, leaving it in
                 // preview state corrupts the subsequent PlayCardAction — card stays in hand).
-                c.DynamicVars.ClearPreview();
             }
             catch { }
+            finally { c.DynamicVars.ClearPreview(); }
 
             // Per-target resolved damage for attack cards: the scalar `stats` above use the
             // card's CurrentTarget, but a single value can't capture target-specific modifiers
             // (Vulnerable #60, Slow #77) or conditional hit counts (Dismantle #78, X-cost
             // Whirlwind #82). Re-run the preview per enemy via MultiCreatureTargeting, the same
             // path the game uses to draw multi-target previews, and read the resolved vars.
-            List<Dictionary<string, object?>>? damageByTarget = null;
             if (c.Type == CardType.Attack && aliveEnemiesForTargeting.Count > 0
                 && (c.TargetType == TargetType.AnyEnemy || c.TargetType == TargetType.AllEnemies))
             {
@@ -2246,6 +2006,8 @@ public class RunSimulator
                     finally { c.DynamicVars.ClearPreview(); }
                 }
             }
+
+#endif
 
             // Use CurrentStarCost (combat-modified) for UI/can_play; BaseStarCost ignores temporary reductions.
             var starCost = c.CurrentStarCost;
@@ -2461,7 +2223,7 @@ public class RunSimulator
                         || reward is MegaCrit.Sts2.Core.Rewards.PotionReward)
                     {
                         try { reward.SelectUnsynchronized().GetAwaiter().GetResult(); _syncCtx.Pump(); }
-                        catch (Exception ex) { Log($"Auto-collect reward: {ex.Message}"); }
+                        catch (Exception ex) { return ErrorWithTrace("Reward collection failed", ex); }
                     }
                     else if (reward is CardReward cr)
                     {
@@ -2472,13 +2234,13 @@ public class RunSimulator
                 if (cardRewards.Count > 0)
                 {
                     _pendingCardReward = cardRewards[0];
-                    _pendingRewards = rewards;
+                    _pendingRewards = cardRewards.Cast<Reward>().ToList();
                     return CardRewardState(player, combatRoom);
                 }
 
                 _pendingRewards = null;
             }
-            catch (Exception ex) { Log($"Generate rewards: {ex.Message}"); }
+            catch (Exception ex) { return ErrorWithTrace("Reward generation failed", ex); }
         }
 
         // No more pending rewards — proceed
@@ -2492,26 +2254,20 @@ public class RunSimulator
         // map_select. Report victory directly in that case.
         if (combatRoom.RoomType == RoomType.Boss)
         {
-            if (_runState != null && _runState.CurrentActIndex >= 2)
-            {
-                Log($"Final boss defeated (Act {_runState.CurrentActIndex + 1}), reporting victory");
-                return GameOverState(true);
-            }
             Log("Boss defeated, entering next act");
             try
             {
                 RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
                 _syncCtx.Pump();
                 WaitForActionExecutor();
-                HealBetweenActs();
             }
-            catch (Exception ex) { Log($"EnterNextAct: {ex.Message}"); }
+            catch (Exception ex) { return ErrorWithTrace("Next act failed", ex); }
             return DetectDecisionPoint();
         }
 
         // Normal → go to map
         ForceToMap();
-        return MapSelectState();
+        return DetectDecisionPoint();
     }
 
     private Dictionary<string, object?> CardRewardState(Player player, CombatRoom? combatRoom)
@@ -2554,17 +2310,15 @@ public class RunSimulator
 
     private void ForceToMap()
     {
-        try
+        var previous = _runState?.CurrentRoom;
+        RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+        _syncCtx.Pump();
+        // The native method resumes a parent event, or opens a Godot map screen.
+        // Only substitute the missing map screen when the room was not resumed.
+        if (_runState?.CurrentRoom == previous && previous is not MapRoom)
         {
-            RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+            RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
             _syncCtx.Pump();
-        }
-        catch { }
-
-        if (_runState?.CurrentRoom is not MapRoom)
-        {
-            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
-            catch (Exception ex) { Log($"ForceToMap: {ex.Message}"); }
         }
     }
 
@@ -2582,29 +2336,15 @@ public class RunSimulator
         // If event is finished, proceed to map
         if (localEvent == null || localEvent.IsFinished)
         {
-            Log($"Event {localEvent?.GetType().Name ?? "null"} finished, proceeding");
-            try
-            {
-                RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
-                _syncCtx.Pump();
-            }
-            catch { }
-            // Force to map if still in event room
-            if (_runState?.CurrentRoom is EventRoom)
-            {
-                try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
-                catch { }
-            }
+            if (localEvent is null) return Error("Missing local event; source invalid.");
+            ForceToMap();
             return _runState?.CurrentRoom is MapRoom ? MapSelectState() : DetectDecisionPoint();
         }
 
         var currentOptions = localEvent.CurrentOptions;
         if (currentOptions == null || currentOptions.Count == 0)
         {
-            Log($"Event {localEvent.GetType().Name} has no options, auto-skipping");
-            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
-            catch { }
-            return MapSelectState();
+            return Error("Unfinished event has no options; source invalid.");
         }
 
         var options = currentOptions
@@ -2778,7 +2518,7 @@ public class RunSimulator
     private Dictionary<string, object?> ShopState(MerchantRoom merchantRoom, Player player)
     {
         var inv = merchantRoom.GetLocalInventory();
-        if (inv == null) { ForceToMap(); return MapSelectState(); }
+        if (inv == null) return Error("Shop inventory is missing; source invalid.");
 
         var cards = inv.CharacterCardEntries.Concat(inv.ColorlessCardEntries)
             .Select((e, i) =>
@@ -2913,7 +2653,7 @@ public class RunSimulator
                 }
             }
         }
-        catch (Exception ex) { Log($"Treasure relic pick: {ex.Message}"); }
+        catch (Exception ex) { return ErrorWithTrace("Treasure relic pick failed", ex); }
 
         try
         {
@@ -2922,25 +2662,10 @@ public class RunSimulator
             treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
             _syncCtx.Pump();
         }
-        catch (InvalidOperationException ex) when (ex.Message.Contains("relic picking session"))
-        {
-            // BUG-013: Relic session conflict — wait for pending session then retry
-            Log($"Relic session conflict, waiting and retrying: {ex.Message}");
-            WaitForActionExecutor();
-            _syncCtx.Pump();
-            try
-            {
-                treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
-                _syncCtx.Pump();
-                treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
-                _syncCtx.Pump();
-            }
-            catch (Exception retryEx) { Log($"Treasure rewards retry failed: {retryEx.Message}"); }
-        }
-        catch (Exception ex) { Log($"Treasure rewards: {ex.Message}"); }
+        catch (Exception ex) { return ErrorWithTrace("Treasure rewards failed", ex); }
 
         ForceToMap();
-        return MapSelectState();
+        return DetectDecisionPoint();
     }
 
     private Dictionary<string, object?> GameOverState(bool isVictory)
@@ -2966,38 +2691,40 @@ public class RunSimulator
 
     #region Helpers
 
+    private Task? _pendingChoiceAction;
+
+    private void WaitForChoiceAction()
+    {
+        var task = _pendingChoiceAction;
+        if (task is null) return;
+        var deadline = System.Diagnostics.Stopwatch.StartNew();
+        while (!task.IsCompleted)
+        {
+            _syncCtx.Pump();
+            if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+                return;
+            if (deadline.Elapsed > TimeSpan.FromSeconds(10))
+                throw new TimeoutException("Native choice action did not complete or request a choice; source is invalid.");
+            Thread.Sleep(1);
+        }
+        _pendingChoiceAction = null;
+        task.GetAwaiter().GetResult();
+    }
+
     private void WaitForActionExecutor()
     {
-        try
+        SynchronizationContext.SetSynchronizationContext(_syncCtx);
+        var deadline = System.Diagnostics.Stopwatch.StartNew();
+        do
         {
-            // Ensure sync context is set for this thread
-            SynchronizationContext.SetSynchronizationContext(_syncCtx);
-
-            // Pump the synchronization context to execute any pending continuations
             _syncCtx.Pump();
-
-            // Executor may stay "running" while the game awaits headless card selection / reward (e.g. Attack Potion).
-            // Spinning here would time out and downstream code could mis-handle an in-flight potion use (BUG-026).
-            if (_cardSelector.HasPending || _cardSelector.HasPendingReward)
+            if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
                 return;
-
-            var executor = RunManager.Instance.ActionExecutor;
-            if (executor.IsRunning)
-            {
-                // Pump while waiting for executor
-                int maxPumps = 1000;
-                for (int i = 0; i < maxPumps; i++)
-                {
-                    _syncCtx.Pump();
-                    if (!executor.IsRunning) break;
-                    Thread.Sleep(1);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Log($"WaitForActionExecutor exception: {ex.Message}");
-        }
+            if (!RunManager.Instance.ActionExecutor.IsRunning) return;
+            if (deadline.Elapsed > TimeSpan.FromSeconds(10))
+                throw new TimeoutException("Action executor did not complete or request a choice; source invalid.");
+            Thread.Sleep(1);
+        } while (true);
     }
 
     private void SpinWaitForCombatStable()
@@ -3017,6 +2744,9 @@ public class RunSimulator
     /// <summary>Compute what a card would look like after upgrading (stats + cost + description).</summary>
     private Dictionary<string, object?>? GetUpgradedInfo(CardModel card)
     {
+#if HEADLESS_EXPORTS_OFF
+        return null;
+#else
         if (!card.IsUpgradable) return null;
         try
         {
@@ -3050,6 +2780,7 @@ public class RunSimulator
             };
         }
         catch { return null; }
+    #endif
     }
 
     private Dictionary<string, object?> PlayerSummary(Player player)
@@ -3190,8 +2921,9 @@ public class RunSimulator
         // Initialize PrefsSave (FastMode etc.). build 23372702 reads PrefsSave.FastMode
         // from many gameplay paths (e.g. Slice.OnPlay anim delay); without this the
         // PrefsSave getter returns null and those paths NRE.
-        try { SaveManager.Instance.InitPrefsDataForTest(); }
-        catch (Exception ex) { Console.Error.WriteLine($"[WARN] SaveManager.InitPrefsDataForTest: {ex.Message}"); }
+        // Required by native Neutralize.OnPlay before AttackCommand.Execute.
+        // Initialization failure is fatal; never substitute card gameplay.
+        SaveManager.Instance.InitPrefsDataForTest();
 
         // Install the Task.Yield patch but keep SuppressYield=false by default.
         // SuppressYield is toggled to true only during EndTurn to prevent boss fight deadlocks.
@@ -3206,6 +2938,7 @@ public class RunSimulator
         // Patch TalkCmd.Play to a no-op (issue #64). Monster speech-bubble VFX during
         // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
         PatchTalkCmd();
+        NativeRewardGenerationPatch.Install();
 
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
@@ -3445,32 +3178,33 @@ public class RunSimulator
 
         public void ResolvePending(IEnumerable<CardModel> selected)
         {
-            _pendingTcs?.TrySetResult(selected);
+            var completion = _pendingTcs ?? throw new InvalidOperationException("No pending card choice.");
             PendingOptions = null;
             _pendingTcs = null;
+            completion.TrySetResult(selected);
         }
 
         public void ResolvePendingByIndices(int[] indices)
         {
-            if (PendingOptions == null) return;
-            var selected = indices
-                .Where(i => i >= 0 && i < PendingOptions.Count)
-                .Select(i => PendingOptions[i])
-                .ToList();
+            if (PendingOptions == null) throw new InvalidOperationException("No pending card choice.");
+            if (indices.Length < PendingMinSelect || indices.Length > PendingMaxSelect ||
+                indices.Distinct().Count() != indices.Length || indices.Any(i => i < 0 || i >= PendingOptions.Count))
+                throw new ArgumentException("Card selection violates bounds, uniqueness, or min/max.");
+            var selected = indices.Select(i => PendingOptions[i]).ToList();
             ResolvePending(selected);
         }
 
         public void CancelPending()
         {
-            _pendingTcs?.TrySetResult(Array.Empty<CardModel>());
-            PendingOptions = null;
-            _pendingTcs = null;
+            if (PendingMinSelect > 0) throw new InvalidOperationException("Required card selection cannot be skipped.");
+            ResolvePending(Array.Empty<CardModel>());
         }
 
         // Pending card reward from events (GetSelectedCardReward blocks until resolved)
         public List<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult>? PendingRewardCards { get; private set; }
         private ManualResetEventSlim? _rewardWait;
         private int _rewardChoice = -1;
+        public bool CanSkipReward { get; private set; }
 
         // NOTE: STS2 build 23372702 changed ICardSelector.GetSelectedCardReward to return
         // a CardRewardSelection struct { CardModel card; CardRewardAlternative alternative }.
@@ -3480,7 +3214,11 @@ public class RunSimulator
             IReadOnlyList<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult> options,
             IReadOnlyList<CardRewardAlternative> alternatives)
         {
-            if (options.Count == 0) return default;  // Skip
+            if (alternatives.Any(a => !string.Equals(a.OptionId, "Skip", StringComparison.OrdinalIgnoreCase)))
+                throw new NotSupportedException("Non-skip card reward alternatives are out_of_scope for this adapter.");
+            CanSkipReward = alternatives.Any(a => string.Equals(a.OptionId, "Skip", StringComparison.OrdinalIgnoreCase));
+            if (options.Count == 0)
+                throw new NotSupportedException("Empty card reward offers are out_of_scope for this adapter.");
 
             // Store pending and block until main loop resolves
             PendingRewardCards = options.ToList();
@@ -3488,7 +3226,8 @@ public class RunSimulator
             _rewardWait = new ManualResetEventSlim(false);
 
             Console.Error.WriteLine($"[SIM] Card reward pending: {options.Count} cards (blocking)");
-            _rewardWait.Wait(TimeSpan.FromSeconds(300)); // Wait up to 5 min
+            if (!_rewardWait.Wait(TimeSpan.FromSeconds(300)))
+                throw new TimeoutException("Card reward choice timed out; source invalid.");
 
             var choice = _rewardChoice;
             PendingRewardCards = null;
@@ -3499,16 +3238,19 @@ public class RunSimulator
             return default;  // Skip (card=null, alternative=null)
         }
 
-        public bool HasPendingReward => PendingRewardCards != null && _rewardWait != null;
+        public bool HasPendingReward => PendingRewardCards != null && _rewardWait is { IsSet: false };
 
         public void ResolveReward(int index)
         {
+            if (!HasPendingReward || index < 0 || index >= PendingRewardCards!.Count)
+                throw new ArgumentOutOfRangeException(nameof(index));
             _rewardChoice = index;
-            _rewardWait?.Set();
+            _rewardWait!.Set();
         }
 
         public void SkipReward()
         {
+            if (!HasPendingReward || !CanSkipReward) throw new InvalidOperationException("Reward cannot be skipped.");
             _rewardChoice = -1;
             _rewardWait?.Set();
         }
@@ -3698,33 +3440,6 @@ public class RunSimulator
             // Use Harmony to patch methods that need fallback behavior
             var harmony = new Harmony("sts2headless.locpatch");
 
-            // With real loc data loaded, we only need fallback patches for:
-            // 1. LocTable.GetRawText — return key for missing entries instead of throwing
-            // 2. LocManager.SmartFormat — _smartFormatter is null, return raw text instead
-            // We do NOT patch GetFormattedText/GetRawText on LocString anymore
-            // so the real localization pipeline works (needed for Neow event etc.)
-
-            var getRawText = typeof(LocTable).GetMethod("GetRawText",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public,
-                null, new[] { typeof(string) }, null);
-            var prefix = typeof(LocPatches).GetMethod(nameof(LocPatches.GetRawTextPrefix),
-                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
-            if (getRawText != null && prefix != null)
-            {
-                harmony.Patch(getRawText, new HarmonyMethod(prefix));
-                Console.Error.WriteLine("[INFO] Patched LocTable.GetRawText");
-            }
-
-            // Patch GetLocString to not throw
-            var getLocString = typeof(LocTable).GetMethod("GetLocString");
-            var glsPrefix = typeof(LocPatches).GetMethod(nameof(LocPatches.GetLocStringPrefix),
-                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
-            if (getLocString != null && glsPrefix != null)
-            {
-                try { harmony.Patch(getLocString, new HarmonyMethod(glsPrefix)); }
-                catch (Exception ex4) { Console.Error.WriteLine($"[WARN] Failed to patch GetLocString: {ex4.Message}"); }
-            }
-
             // Patch FromChooseABundleScreen to use our card selector
             try
             {
@@ -3740,41 +3455,6 @@ public class RunSimulator
             }
             catch (Exception ex) { Console.Error.WriteLine($"[WARN] Bundle patch: {ex.Message}"); }
 
-            // Patch Neutralize.OnPlay to avoid NullRef in DamageCmd.Attack().Execute()
-            try
-            {
-                var neutralizeType = typeof(MegaCrit.Sts2.Core.Models.Cards.Neutralize);
-                var neutralizeOnPlay = neutralizeType.GetMethod("OnPlay",
-                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                if (neutralizeOnPlay != null)
-                {
-                    var neutPrefix = typeof(LocPatches).GetMethod(nameof(LocPatches.NeutralizePrefix),
-                        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
-                    if (neutPrefix != null)
-                    {
-                        harmony.Patch(neutralizeOnPlay, new HarmonyMethod(neutPrefix));
-                        Console.Error.WriteLine("[INFO] Patched Neutralize.OnPlay");
-                    }
-                }
-            }
-            catch (Exception ex) { Console.Error.WriteLine($"[WARN] Neutralize patch: {ex.Message}"); }
-
-            // Patch HasEntry to always return true
-            PatchMethod(harmony, typeof(LocTable), "HasEntry", nameof(LocPatches.HasEntryPrefix));
-
-            // Patch IsLocalKey to always return true
-            PatchMethod(harmony, typeof(LocTable), "IsLocalKey", nameof(LocPatches.HasEntryPrefix));
-
-            // Patch LocString.Exists (static) to always return true
-            var locStringExists = typeof(LocString).GetMethod("Exists",
-                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
-            if (locStringExists != null)
-            {
-                PatchMethod(harmony, locStringExists, nameof(LocPatches.HasEntryPrefix));
-            }
-
-            // Patch LocTable.GetLocStringsWithPrefix to return empty list
-            PatchMethod(harmony, typeof(LocTable), "GetLocStringsWithPrefix", nameof(LocPatches.GetLocStringsWithPrefixPrefix));
         }
         catch (Exception ex)
         {
@@ -3782,84 +3462,8 @@ public class RunSimulator
         }
     }
 
-    private static void PatchMethod(Harmony harmony, Type type, string methodName, string patchName)
-    {
-        try
-        {
-            var method = type.GetMethod(methodName, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-            PatchMethod(harmony, method, patchName);
-        }
-        catch (Exception ex) { Console.Error.WriteLine($"[WARN] Failed to patch {type.Name}.{methodName}: {ex.Message}"); }
-    }
-
-    private static void PatchMethod(Harmony harmony, System.Reflection.MethodInfo? method, string patchName)
-    {
-        if (method == null) return;
-        try
-        {
-            var prefix = typeof(LocPatches).GetMethod(patchName, System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
-            if (prefix != null) harmony.Patch(method, new HarmonyMethod(prefix));
-        }
-        catch (Exception ex) { Console.Error.WriteLine($"[WARN] Failed to patch {method.Name}: {ex.Message}"); }
-    }
-
     internal static class LocPatches
     {
-        public static bool GetRawTextPrefix(LocTable __instance, string key, ref string __result)
-        {
-            // Return key as fallback "translation"
-            __result = key;
-            return false;
-        }
-
-        public static bool GetFormattedTextPrefix(LocString __instance, ref string __result)
-        {
-            __result = __instance?.LocEntryKey ?? "";
-            return false;
-        }
-
-        public static bool GetRawTextInstancePrefix(LocString __instance, ref string __result)
-        {
-            __result = __instance?.LocEntryKey ?? "";
-            return false;
-        }
-
-
-        /// <summary>Harmony prefix: replace Neutralize.OnPlay with safe damage+weak.</summary>
-        public static bool NeutralizePrefix(CardModel __instance, ref Task __result,
-            PlayerChoiceContext choiceContext, CardPlay cardPlay)
-        {
-            if (cardPlay.Target == null) { __result = Task.CompletedTask; return false; }
-            __result = NeutralizeSafe(__instance, choiceContext, cardPlay);
-            return false;
-        }
-
-        private static async Task NeutralizeSafe(CardModel card, PlayerChoiceContext ctx, CardPlay play)
-        {
-            try
-            {
-                await CreatureCmd.Damage(ctx, play.Target!, card.DynamicVars.Damage, card, play);
-                await PowerCmd.Apply<WeakPower>(ctx, play.Target!, card.DynamicVars["WeakPower"].BaseValue,
-                    card.Owner.Creature, card, false);
-            }
-            catch (Exception ex) { Console.Error.WriteLine($"[WARN] Neutralize safe: {ex.Message}"); }
-        }
-
-        public static bool HasEntryPrefix(ref bool __result)
-        {
-            __result = true;
-            return false;
-        }
-
-        public static bool GetLocStringPrefix(LocTable __instance, string key, ref LocString __result)
-        {
-            var nameField = typeof(LocTable).GetField("_name",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-            var tableName = nameField?.GetValue(__instance) as string ?? "_unknown";
-            __result = new LocString(tableName, key);
-            return false;
-        }
-
         /// <summary>
         /// Intercept bundle selection — store bundles and wait for player to pick a pack index.
         /// </summary>
@@ -3886,18 +3490,12 @@ public class RunSimulator
                 return false;
             }
 
-            __result = Task.FromResult<IEnumerable<CardModel>>(bundles[0]);
-            return false;
+            throw new InvalidOperationException("Bundle selection has no headless choice owner.");
         }
 
         // Static reference so Harmony patch can access the simulator instance
         internal static RunSimulator? _bundleSimRef;
 
-        public static bool GetLocStringsWithPrefixPrefix(ref IReadOnlyList<LocString> __result)
-        {
-            __result = new List<LocString>();
-            return false;
-        }
     }
 
     private static void Log(string message)
