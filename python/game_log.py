@@ -50,7 +50,10 @@ class GameLogger:
         safe_seed = str(seed).replace("/", "_")
         filename = f"{ts}_{character}_{safe_seed}.jsonl"
         self._path = os.path.join(LOG_DIR, filename)
-        self._file = open(self._path, "w")
+        # Explicit UTF-8: the default encoding is the system locale (GBK on a Chinese
+        # Windows install), which makes the log unreadable to any tool that assumes UTF-8
+        # and silently corrupts non-ASCII card and monster names.
+        self._file = open(self._path, "w", encoding="utf-8")
 
     def log_state(self, state: dict):
         """Log a state/decision point received from the simulator."""

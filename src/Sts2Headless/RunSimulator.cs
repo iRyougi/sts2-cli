@@ -303,6 +303,86 @@ public class RunSimulator
         return field?.GetValue(obj) as List<T>;
     }
 
+    /// <summary>
+    /// Ordered contents of a card pile, with per-card UIDs.
+    ///
+    /// Counts alone cannot support an action-level comparison against a simulator: a shuffle, a
+    /// discard and a draw all change counts identically. Order plus identity is what makes a
+    /// replay checkable.
+    /// </summary>
+    private static List<Dictionary<string, object?>>? PileEntries(CardPile? pile)
+    {
+        var cards = pile?.Cards;
+        if (cards == null) return null;
+        var list = new List<Dictionary<string, object?>>(cards.Count);
+        foreach (var c in cards)
+        {
+            list.Add(new Dictionary<string, object?>
+            {
+                ["card"] = c?.Id.Entry,
+                ["uid"] = CardUid.Of(c),
+                ["upgraded"] = c?.IsUpgraded ?? false,
+            });
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// Counter and generator state of every RNG stream, read through the engine's own
+    /// <c>ToSerializable()</c>.
+    ///
+    /// A replay that matches on visible state can still have consumed a different number of
+    /// random draws; that divergence only surfaces floors later. Exporting the stream counters
+    /// makes it detectable at the step where it happens. Reflective, so a renamed member
+    /// degrades to a null field instead of breaking the build on the next game version.
+    /// </summary>
+    private static object? RngSnapshot(object? rngSet)
+    {
+        if (rngSet == null) return null;
+        try
+        {
+            var ser = rngSet.GetType().GetMethod("ToSerializable", Type.EmptyTypes)?.Invoke(rngSet, null);
+            if (ser == null) return null;
+            var outer = new Dictionary<string, object?>();
+            foreach (var prop in ser.GetType().GetProperties())
+            {
+                object? value;
+                try { value = prop.GetValue(ser); } catch { continue; }
+                if (value is System.Collections.IDictionary streams)
+                {
+                    var inner = new Dictionary<string, object?>();
+                    foreach (System.Collections.DictionaryEntry entry in streams)
+                    {
+                        inner[entry.Key?.ToString() ?? "?"] = FlattenPublicState(entry.Value);
+                    }
+                    outer[prop.Name] = inner;
+                }
+                else
+                {
+                    outer[prop.Name] = value;
+                }
+            }
+            return outer.Count > 0 ? outer : null;
+        }
+        catch { return null; }
+    }
+
+    private static object? FlattenPublicState(object? value)
+    {
+        if (value == null) return null;
+        var dict = new Dictionary<string, object?>();
+        foreach (var f in value.GetType().GetFields())
+        {
+            try { dict[f.Name] = f.GetValue(value); } catch { }
+        }
+        foreach (var prop in value.GetType().GetProperties())
+        {
+            if (prop.GetIndexParameters().Length > 0) continue;
+            try { dict[prop.Name] = prop.GetValue(value); } catch { }
+        }
+        return dict.Count > 0 ? dict : value;
+    }
+
     private static void SetField(object obj, string fieldName, object? value)
     {
         var field = obj.GetType().GetField(fieldName, NonPublic);
@@ -2173,6 +2253,7 @@ public class RunSimulator
             {
                 ["index"] = i,
                 ["id"] = c.Id.ToString(),
+                ["uid"] = CardUid.Of(c),
                 ["name"] = _loc.Card(c.Id.Entry),
                 ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
                 ["type"] = c.Type.ToString(),
@@ -2297,6 +2378,11 @@ public class RunSimulator
             ["player_powers"] = playerPowers?.Count > 0 ? playerPowers : null,
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
+            ["draw_pile"] = PileEntries(pcs?.DrawPile),
+            ["discard_pile"] = PileEntries(pcs?.DiscardPile),
+            ["exhaust_pile"] = PileEntries(pcs?.ExhaustPile),
+            ["rng"] = RngSnapshot(_runState?.Rng),
+            ["player_rng"] = RngSnapshot(player?.PlayerRng),
         };
 
         // Character-specific mechanics
@@ -2442,6 +2528,7 @@ public class RunSimulator
             {
                 ["index"] = i,
                 ["id"] = c.Id.ToString(),
+                ["uid"] = CardUid.Of(c),
                 ["name"] = _loc.Card(c.Id.Entry),
                 ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
                 ["type"] = c.Type.ToString(),
@@ -3008,6 +3095,7 @@ public class RunSimulator
                 var dcard = new Dictionary<string, object?>
                 {
                     ["id"] = c.Id.ToString(),
+                    ["uid"] = CardUid.Of(c),
                     ["name"] = _loc.Card(c.Id.Entry),
                     ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
                     ["type"] = c.Type.ToString(),
