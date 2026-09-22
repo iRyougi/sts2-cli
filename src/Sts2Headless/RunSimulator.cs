@@ -243,9 +243,17 @@ public class RunSimulator
             var seedStr = seed ?? "headless_" + DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             Log($"Creating RunState with seed={seedStr}");
 
-            // Use CreateForTest which properly handles mutable copies internally
-            _runState = RunState.CreateForTest(
+            // Match the native lobby's independent act-selection stream, then the
+            // production factory (including starting-deck AfterCreated hooks).
+            var actSelection = new MegaCrit.Sts2.Core.Random.Rng(
+                MegaCrit.Sts2.Core.Helpers.StringHelper.GetDeterministicHashCode(seedStr), "act_selection");
+            var acts = ActModel.GetRandomList(actSelection, player.UnlockState, false)
+                .Select(act => act.ToMutable()).ToList();
+            _runState = RunState.CreateForNewRun(
                 players: new[] { player },
+                acts: acts,
+                modifiers: Array.Empty<ModifierModel>(),
+                gameMode: MegaCrit.Sts2.Core.Runs.GameMode.Standard,
                 ascensionLevel: ascension,
                 seed: seedStr
             );
