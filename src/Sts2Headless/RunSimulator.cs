@@ -275,7 +275,7 @@ public class RunSimulator
             Log("Run launched");
 
             // Register event handlers for combat turn transitions
-            CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
+            CombatManager.Instance.TurnStarted += state => { if (state.CurrentSide == CombatSide.Player) _turnStarted.Set(); };
             CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
 
             // Finalize starting relics
@@ -321,6 +321,9 @@ public class RunSimulator
     private static List<Dictionary<string, object?>>? PileEntries(CardPile? pile)
     {
 #if HEADLESS_EXPORTS_OFF
+        // Keep first-seen diagnostic card IDs in the same order as exports-on.
+        if (pile?.Cards is { } cards)
+            foreach (var card in cards) CardUid.Of(card);
         return null;
 #else
         var cards = pile?.Cards;
@@ -616,7 +619,7 @@ public class RunSimulator
             RunManager.Instance.SetUpSavedSingleplayer(_runState, save).GetAwaiter().GetResult();
             LocalContext.NetId = netService.NetId;
 
-            CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
+            CombatManager.Instance.TurnStarted += state => { if (state.CurrentSide == CombatSide.Player) _turnStarted.Set(); };
             CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
             CardSelectCmd.UseSelector(_cardSelector);
             LocPatches._bundleSimRef = this;
@@ -1172,17 +1175,16 @@ public class RunSimulator
             PlayerCmd.EndTurn(player, canBackOut: false);
             _syncCtx.Pump();
 
-            // Fallback: if turn didn't complete synchronously, keep pumping with SuppressYield on
-            if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
+            // TurnStarted for the player fires after native setup and auto-pre-play hooks.
+            // Play phase alone can become visible before those hooks finish mutating the hand.
+            for (var i = 0; i < 2000; i++)
             {
-                for (int i = 0; i < 50; i++)
-                {
-                    _syncCtx.Pump();
-                    if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                    if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                    if (IsPlayPhase()) break;
-                    Thread.Sleep(5);
-                }
+                _syncCtx.Pump();
+                if (_turnStarted.IsSet || _combatEnded.IsSet || !CombatManager.Instance.IsInProgress
+                    || player.Creature.IsDead || _cardSelector.HasPending || _cardSelector.HasPendingReward
+                    || _pendingBundles != null)
+                    break;
+                Thread.Sleep(5);
             }
         }
         finally
@@ -1190,7 +1192,10 @@ public class RunSimulator
             YieldPatches.SuppressYield = false;
         }
 
-        if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
+        // A start-of-turn power can request a card choice before Play phase resumes.
+        if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+            return DetectDecisionPoint();
+        if (CombatManager.Instance.IsInProgress && (!_turnStarted.IsSet || !IsPlayPhase()) && !player.Creature.IsDead)
             return Error("Enemy turn did not reach a decision boundary; source invalid (no cancellation or retry).");
 
         return DetectDecisionPoint();
@@ -1309,6 +1314,8 @@ public class RunSimulator
 
         try
         {
+            var purchasedRelicName = entry.Model?.GetType().Name ?? "?";
+            var purchasedRelicCost = entry.Cost;
             // The pickup effect can open a card_select (e.g. KIFUDA → enchant up to 3 with
             // Adroit, #80). Run the purchase on a background task and yield as soon as a
             // pending selection appears so the caller can resolve it; the background task
@@ -1316,9 +1323,9 @@ public class RunSimulator
             var inv = merchantRoom.GetLocalInventory();
             _pendingChoiceAction = Task.Run(() => entry.OnTryPurchaseWrapper(inv));
                 WaitForChoiceAction();
-            Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought relic: {purchasedRelicName} for {purchasedRelicCost}g");
         }
-        catch (Exception ex) { return Error($"Buy relic failed: {ex.Message}"); }
+        catch (Exception ex) { return ErrorWithTrace("Buy relic failed", ex); }
 
         return DetectDecisionPoint();
     }
@@ -1340,9 +1347,11 @@ public class RunSimulator
 
         try
         {
+            var purchasedPotionName = entry.Model?.GetType().Name ?? "?";
+            var purchasedPotionCost = entry.Cost;
             entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
             _syncCtx.Pump();
-            Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought potion: {purchasedPotionName} for {purchasedPotionCost}g");
         }
         catch (Exception ex)
         {
@@ -2946,6 +2955,7 @@ public class RunSimulator
         // Patch TalkCmd.Play to a no-op (issue #64). Monster speech-bubble VFX during
         // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
         PatchTalkCmd();
+        HeadlessEventVisualPatch.Install();
         NativeRewardGenerationPatch.Install();
 
         // Initialize localization system (needed for events, cards, etc.)
