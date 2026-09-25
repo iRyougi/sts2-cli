@@ -406,7 +406,16 @@ public class RunSimulator
     private static void SetField(object obj, string fieldName, object? value)
     {
         var field = obj.GetType().GetField(fieldName, NonPublic);
-        field?.SetValue(obj, value);
+        (field ?? throw new MissingFieldException(obj.GetType().FullName, fieldName)).SetValue(obj, value);
+    }
+
+    private static string RequiredModelEntry(System.Text.Json.JsonElement value, string category)
+    {
+        var id = value.GetString() ?? throw new ArgumentException($"Missing {category} ID");
+        var prefix = category + ".";
+        if (id.StartsWith(prefix, StringComparison.Ordinal)) id = id[prefix.Length..];
+        if (id.Length == 0 || id.Contains('.')) throw new ArgumentException($"Invalid {category} ID: {id}");
+        return id;
     }
 
     public Dictionary<string, object?> SetPlayer(Dictionary<string, System.Text.Json.JsonElement> args)
@@ -414,6 +423,26 @@ public class RunSimulator
         try
         {
             if (_runState == null) return Error("No run in progress");
+            if (args.TryGetValue("act_index", out var actEl))
+            {
+                int actIndex = actEl.GetInt32();
+                if (actIndex < 0 || actIndex >= _runState.Acts.Count)
+                    throw new ArgumentOutOfRangeException(nameof(actIndex), actIndex, "Unknown act");
+                if (actIndex != _runState.CurrentActIndex)
+                {
+                    RunManager.Instance.EnterAct(actIndex, doTransition: false).GetAwaiter().GetResult();
+                    _syncCtx.Pump();
+                }
+            }
+            if (args.TryGetValue("act_id", out var actIdEl))
+            {
+                var id = RequiredModelEntry(actIdEl, "ACT");
+                var act = ModelDb.GetById<ActModel>(new ModelId("ACT", id))
+                    ?? throw new ArgumentException($"Unknown ACT ID: {id}");
+                var setAct = typeof(RunState).GetMethod("SetActDebug", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    ?? throw new MissingMethodException("Native RunState.SetActDebug");
+                setAct.Invoke(_runState, new object[] { act.ToMutable() });
+            }
             var player = _runState.Players[0];
 
             if (args.TryGetValue("hp", out var hpEl) && player.Creature != null)
@@ -426,15 +455,16 @@ public class RunSimulator
             if (args.TryGetValue("relics", out var relicsEl))
             {
                 var list = GetBackingList<RelicModel>(player, "_relics");
-                if (list != null)
+                if (list == null) throw new MissingFieldException(player.GetType().FullName, "_relics");
                 {
                     list.Clear();
                     foreach (var rEl in relicsEl.EnumerateArray())
                     {
-                        var id = rEl.GetString();
-                        if (id == null) continue;
-                        var model = ModelDb.GetById<RelicModel>(new ModelId("RELIC", id));
-                        if (model != null) list.Add(model.ToMutable());
+                        var id = RequiredModelEntry(rEl, "RELIC");
+                        var model = ModelDb.GetById<RelicModel>(new ModelId("RELIC", id))
+                            ?? throw new ArgumentException($"Unknown RELIC ID: {id}");
+                        // Save/load-style insertion assigns Owner without Obtain hooks.
+                        player.AddRelicInternal(model.ToMutable(), silent: true);
                     }
                 }
             }
@@ -447,40 +477,58 @@ public class RunSimulator
                 // Add new cards via RunState.CreateCard (sets Owner + registers)
                 foreach (var cEl in deckEl.EnumerateArray())
                 {
-                    var id = cEl.GetString();
-                    if (id == null) continue;
-                    var canonical = ModelDb.GetById<CardModel>(new ModelId("CARD", id));
-                    if (canonical != null)
+                    var idElement = cEl.ValueKind == System.Text.Json.JsonValueKind.Object
+                        ? cEl.GetProperty("id") : cEl;
+                    var id = RequiredModelEntry(idElement, "CARD");
+                    var canonical = ModelDb.GetById<CardModel>(new ModelId("CARD", id))
+                        ?? throw new ArgumentException($"Unknown CARD ID: {id}");
+                    var card = _runState.CreateCard(canonical, player);
+                    if (cEl.ValueKind == System.Text.Json.JsonValueKind.Object)
                     {
-                        var card = _runState.CreateCard(canonical, player);
-                        player.Deck.AddInternal(card, silent: true);
+                        if (cEl.TryGetProperty("enchantment", out var enchantmentEl)
+                            && enchantmentEl.ValueKind != System.Text.Json.JsonValueKind.Null)
+                        {
+                            var enchantmentId = RequiredModelEntry(enchantmentEl.GetProperty("id"), "ENCHANTMENT");
+                            var enchantment = ModelDb.GetById<EnchantmentModel>(new ModelId("ENCHANTMENT", enchantmentId))
+                                ?? throw new ArgumentException($"Unknown ENCHANTMENT ID: {enchantmentId}");
+                            int amount = enchantmentEl.GetProperty("amount").GetInt32();
+                            var mutable = enchantment.ToMutable();
+                            card.EnchantInternal(mutable, amount);
+                            mutable.ModifyCard();
+                            card.FinalizeUpgradeInternal();
+                        }
+                        int upgradeLevel = cEl.TryGetProperty("upgrade_level", out var levelEl) ? levelEl.GetInt32() : 0;
+                        if (upgradeLevel < 0 || upgradeLevel > 10)
+                            throw new ArgumentOutOfRangeException(nameof(upgradeLevel), upgradeLevel, "Invalid card upgrade level");
+                        for (int i = 0; i < upgradeLevel; i++)
+                        {
+                            card.UpgradeInternal();
+                            card.FinalizeUpgradeInternal();
+                        }
                     }
+                    player.Deck.AddInternal(card, silent: true);
                 }
             }
             if (args.TryGetValue("potions", out var potionsEl))
             {
                 var slots = GetBackingList<PotionModel>(player, "_potionSlots")
                          ?? GetBackingList<PotionModel?>(player, "_potionSlots") as System.Collections.IList;
-                if (slots != null)
+                if (slots == null) throw new MissingFieldException(player.GetType().FullName, "_potionSlots");
                 {
                     for (int i = 0; i < slots.Count; i++) slots[i] = null;
                     int idx = 0;
                     foreach (var pEl in potionsEl.EnumerateArray())
                     {
-                        if (idx >= slots.Count) break;
-                        var id = pEl.GetString();
-                        if (id != null)
+                        if (idx >= slots.Count) throw new ArgumentException("More potions than available slots");
+                        if (pEl.ValueKind != System.Text.Json.JsonValueKind.Null)
                         {
-                            var model = ModelDb.GetById<PotionModel>(new ModelId("POTION", id));
-                            // Inject a mutable instance (not the canonical model — that throws
-                            // CanonicalModelException when the game reads potion.Owner) and set its
-                            // Owner, or UsePotionAction fails with "without an owner!".
-                            if (model != null)
-                            {
-                                var mutable = model.ToMutable();
-                                mutable.Owner = player;
-                                slots[idx] = mutable;
-                            }
+                            var id = RequiredModelEntry(pEl, "POTION");
+                            var model = ModelDb.GetById<PotionModel>(new ModelId("POTION", id))
+                                ?? throw new ArgumentException($"Unknown POTION ID: {id}");
+                            // Inject a mutable instance with its owner, without obtaining hooks.
+                            var mutable = model.ToMutable();
+                            mutable.Owner = player;
+                            slots[idx] = mutable;
                         }
                         idx++;
                     }
