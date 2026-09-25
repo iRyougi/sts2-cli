@@ -2631,6 +2631,19 @@ public class RunSimulator
         WaitForActionExecutor();
         _syncCtx.Pump();
 
+        // Native NTreasureRoom.OpenChest order: DoNormalRewards (gold) -> DoExtraRewardsIfNeeded ->
+        // relic picking. Obtaining the relic first let pickup effects (e.g. BowlerHat) modify
+        // the chest gold, which the real game never does (sts2-ai issue #73).
+        try
+        {
+            treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
+            _syncCtx.Pump();
+        }
+        catch (Exception ex) { return ErrorWithTrace("Treasure rewards failed", ex); }
+
+
         // TreasureRoom.EnterInternal opens a relic-picking session (BeginRelicPicking) that the
         // headless must drive, otherwise (a) no relic is ever awarded and (b) the session stays
         // open so the NEXT treasure room's BeginRelicPicking throws "relic picking session while
@@ -2680,15 +2693,6 @@ public class RunSimulator
             }
         }
         catch (Exception ex) { return ErrorWithTrace("Treasure relic pick failed", ex); }
-
-        try
-        {
-            treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
-            _syncCtx.Pump();
-            treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
-            _syncCtx.Pump();
-        }
-        catch (Exception ex) { return ErrorWithTrace("Treasure rewards failed", ex); }
 
         ForceToMap();
         return DetectDecisionPoint();
