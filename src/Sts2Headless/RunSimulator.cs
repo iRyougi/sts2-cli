@@ -9,6 +9,7 @@ using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.Helpers;
+using MegaCrit.Sts2.Core.Hooks;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Characters;
@@ -1106,15 +1107,19 @@ public class RunSimulator
         Log($"Playing card {card.GetType().Name} (index {cardIndex}) targeting {(target != null ? target.Monster?.GetType().Name ?? "creature" : "none")}");
 
         var handCountBefore = hand.Count;
+        var finishedPlaysBefore = CombatManager.Instance.History.CardPlaysFinished.Count(e => e.CardPlay.Card == card);
 
         var playAction = new PlayCardAction(card, target);
         RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(playAction);
         WaitForActionExecutor();
 
-        // Check if card play had no effect (hand unchanged, same card still at same index)
+        // A native effect such as FeralPower may return the played card to the same hand
+        // position. Confirm the native finished-play history before treating that as failure.
         var handAfter = pcs.Hand.Cards;
-        if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
+        if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card &&
+            CombatManager.Instance.History.CardPlaysFinished.Count(e => e.CardPlay.Card == card) == finishedPlaysBefore)
         {
+            Log($"Card action remained in hand: actionState={playAction.State}, phase={player.PlayerCombatState?.Phase}, target={target?.CombatId}, executorPaused={RunManager.Instance.ActionExecutor.IsPaused}");
             return Error($"Card could not be played (still in hand after action): {card.GetType().Name} [{card.Id}]");
         }
 
@@ -1873,7 +1878,9 @@ public class RunSimulator
             }
             else
             {
-                choices = (currentPoint.Children ?? Enumerable.Empty<MapPoint>())
+                // Match NMapScreen: free-travel hooks (for example WingedBoots) may add
+                // reachable points outside the current point's direct children.
+                choices = MapTravel.GetTravelablePointsFrom(_runState, currentPoint)
                     .Select(child => new Dictionary<string, object?>
                     {
                         ["col"] = (int)child.coord.col,
@@ -1915,6 +1922,7 @@ public class RunSimulator
         {
             ["type"] = "decision",
             ["decision"] = "map_select",
+            ["map_choices_native"] = currentCoord.HasValue,
             ["context"] = RunContext(),
             ["choices"] = choices,
             ["player"] = PlayerSummary(_runState!.Players[0]),
@@ -2225,10 +2233,11 @@ public class RunSimulator
             _goldBeforeCombat = player.Gold;
             try
             {
-                var rewardsSet = new RewardsSet(player).WithRewardsFromRoom(combatRoom);
-                // build 23372702: GenerateWithoutOffering() now returns Task (void);
-                // generated rewards live on rewardsSet.Rewards afterwards.
-                rewardsSet.GenerateWithoutOffering().GetAwaiter().GetResult();
+                // Mirror CombatRoom.OfferRoomEndRewards: generate with the native command,
+                // then run the combat reward hook before exposing or collecting rewards.
+                var rewardsSet = RewardsCmd.GenerateForRoomEnd(player, combatRoom).GetAwaiter().GetResult();
+                Hook.BeforeCombatRewardOffered(rewardsSet, combatRoom.CombatState.RunState, combatRoom)
+                    .GetAwaiter().GetResult();
                 var rewards = rewardsSet.Rewards;
                 _syncCtx.Pump();
 
